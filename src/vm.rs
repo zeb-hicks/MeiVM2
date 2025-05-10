@@ -1,6 +1,6 @@
-mod persist;
-mod register;
-mod opcode;
+pub mod persist;
+pub mod register;
+pub mod opcode;
 
 use std::{
     collections::{HashMap, VecDeque}, fmt::Display, sync::Arc
@@ -2063,4 +2063,3 @@ mod tests {
         reflective_persist_test(&state);
     }
 }
-
