@@ -36,6 +36,30 @@ const MEM_SHARED_SIZE_U: usize = MEM_SHARED_SIZE as usize;
 const WORD_DELAY_PRIV_TO_SHARED: u32 = 64;
 const WORD_DELAY_PRIV_FROM_SHARED: u32 = 16;
 
+pub enum MemoryRegion {
+    Registers,
+    PrivateNonVolatile,
+    PrivateNonVolatileBanked,
+    ModuleIO,
+    RemoteAperture,
+    PrivateVolatile,
+    Shared,
+    Invalid,
+}
+
+pub fn memory_region_at(addr: u16) -> MemoryRegion {
+    match addr {
+        0..MEM_PRIV_NV_START => MemoryRegion::Registers,
+        MEM_PRIV_NV_START..MEM_PRIV_NVT_END => MemoryRegion::PrivateNonVolatile,
+        MEM_PRIV_NVT_END..MEM_PRIV_NV_END => MemoryRegion::PrivateNonVolatileBanked,
+        MEM_PRIV_IO_START..MEM_PRIV_IO_END => MemoryRegion::ModuleIO,
+        MEM_PRIV_RA_START..MEM_PRIV_RA_END => MemoryRegion::RemoteAperture,
+        MEM_PRIV_V_START..MEM_PRIV_V_END => MemoryRegion::PrivateVolatile,
+        MEM_SHARED_START..MEM_SHARED_END => MemoryRegion::Shared,
+        _ => MemoryRegion::Invalid,
+    }
+}
+
 fn inc_addr(addr: u16) -> u16 {
     let next = addr.wrapping_add(1);
     if addr < MEM_PRIV_NV_END {
