@@ -97,6 +97,10 @@ async fn sim_parse_chat(
             "stop" | "halt" | "crash" | "lunch" => {
                 sim_vm.user_halt(user_id);
             }
+            "ident" => {
+                let vmuser = sim_vm.user_new(user_id);
+                vmuser.context.ident_time = 10000;
+            }
             "reset" | "clear" => {
                 sim_vm.user_reset(user_id);
             }
@@ -113,7 +117,11 @@ async fn sim_parse_chat(
                 }
             }
             "dump" => { sim_vm.user_dump(user_id); }
-            "summon" => { sim_vm.user_new(user_id); }
+            "summon" => {
+                let vmuser = sim_vm.user_new(user_id);
+                vmuser.context.user_color_loaded = true;
+                vmuser.context.ship.set_color(user_color);
+            }
             "auth" | "login" | "logon" => {
                 let id = (split.next()?, split.next()?, split.next()?, split.next()?);
                 return Some(format!("{} {} {} {}", id.0, id.1, id.2, id.3));
@@ -603,7 +611,6 @@ async fn ext_handler(
                         if let Some(value) = value {
                             if let Err(e) = stream.send(match value {
                                 ClientData::Binary(value) => {
-                                    if Arc::strong_count(&value) > 1 { println!("vm update is cloning"); }
                                     WSMessage::Binary(Arc::unwrap_or_clone(value).into())
                                 }
                                 ClientData::Text(value) => WSMessage::Text(value.to_string()),
@@ -690,7 +697,6 @@ async fn vmio_handler(
                     };
                     if let Err(e) = stream.send(match value {
                         ClientData::Binary(value) => {
-                            if Arc::strong_count(&value) > 1 { println!("vm update is cloning"); }
                             WSMessage::Binary(Arc::unwrap_or_clone(value).into())
                         }
                         ClientData::Text(value) => WSMessage::Text(value.to_string()),
