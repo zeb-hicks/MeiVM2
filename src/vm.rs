@@ -1662,86 +1662,76 @@ impl SimulationVM {
         user.dump();
         user.proc.dump();
     }
-    pub fn user_write(&mut self, _: u64, addr: u16, value: u16) {
-        // let user = self.make_user(user_id);
-        if let Some(&user_proc) = self.processes.front() {
-            let procs = unsafe {[
-                (*user_proc).proc.as_mut(),
-                (*user_proc).agent.as_mut(),
-            ]};
-            let mut ctx = Cycle {
-                vm: self,
-                user: user_proc,
-            };
-            // println!("User write: {} to {:04x} in proc {}", value, addr, proc);
-            match addr {
-                0..0x40 => {
-                    // proc.reg_index((addr >> 2).into()).index(addr as u8)
-                    // if let Some(reg) = procs[0].reg_index_mut((addr >> 2).into()) {
-                    //     *reg.index_mut(addr as u8) = value;
-                    // }
-                    procs[0].write_priv(addr, value);
-                },
-                MEM_PRIV_NV_START..MEM_PRIV_NVT_END => {
-                    procs[0].priv_mem[addr as usize - MEM_PRIV_NV_START_U] = value;
-                },
-                MEM_PRIV_NVT_END..MEM_PRIV_NV_END => {},
-                MEM_PRIV_IO_START..MEM_PRIV_IO_END => {
-                    unsafe {
-                        let addr = addr - MEM_PRIV_IO_START;
-                        if let Some((thing, offset)) = (*user_proc).io_decode(procs[0], addr) {
-                            thing.write_bank(&mut ctx, offset, value)
-                        } else if let Some((thing, offset)) = (*user_proc).io_decode(procs[1], addr) {
-                            thing.write_bank(&mut ctx, offset, value)
-                        }
+    pub fn user_write(&mut self, uid: u64, addr: u16, value: u16) {
+        let user = self.make_user(uid);
+        let user_addr: *mut VMUser = &mut **user;
+
+        let procs = unsafe {[
+            (*user_addr).proc.as_mut(),
+            (*user_addr).agent.as_mut(),
+        ]};
+        let mut ctx = Cycle {
+            vm: self,
+            user: user_addr,
+        };
+        match addr {
+            0..0x40 => {
+                procs[0].write_priv(addr, value);
+            },
+            MEM_PRIV_NV_START..MEM_PRIV_NVT_END => {
+                procs[0].priv_mem[addr as usize - MEM_PRIV_NV_START_U] = value;
+            },
+            MEM_PRIV_NVT_END..MEM_PRIV_NV_END => {},
+            MEM_PRIV_IO_START..MEM_PRIV_IO_END => {
+                unsafe {
+                    let addr = addr - MEM_PRIV_IO_START;
+                    if let Some((thing, offset)) = (*user_addr).io_decode(procs[0], addr) {
+                        thing.write_bank(&mut ctx, offset, value)
+                    } else if let Some((thing, offset)) = (*user_addr).io_decode(procs[1], addr) {
+                        thing.write_bank(&mut ctx, offset, value)
                     }
-                },
-                MEM_PRIV_RA_START..MEM_PRIV_RA_END => {},
-                MEM_PRIV_V_START..MEM_PRIV_V_END => {},
-                MEM_SHARED_START..MEM_SHARED_END => {
-                    ctx.vm.memory[(addr as usize).wrapping_sub(MEM_SHARED_START_U)].0 = value;
                 }
-                _ => {}
-            };
-        }
-    }
-    pub fn user_read(&mut self, _: u64, addr: u16) -> u16 {
-        // let user = self.make_user(user_id);
-        // let user = self.users.get_mut(&user_id).unwrap();
-        if let Some(&user_proc) = self.processes.front() {
-            let procs = unsafe {[
-                (*user_proc).proc.as_mut(),
-                (*user_proc).agent.as_mut(),
-            ]};
-            let mut ctx = Cycle {
-                vm: self,
-                user: user_proc,
-            };
-            match addr {
-                0..0x40 => procs[0].read_priv(addr),
-                // procs[0].reg_index((addr >> 2).into()).index(addr as u8),
-                MEM_PRIV_NV_START..MEM_PRIV_NVT_END =>
-                    procs[0].priv_mem[addr as usize - MEM_PRIV_NV_START_U],
-                MEM_PRIV_NVT_END..MEM_PRIV_NV_END => 0,
-                MEM_PRIV_IO_START..MEM_PRIV_IO_END =>
-                    unsafe {
-                        let addr = addr - MEM_PRIV_IO_START;
-                        if let Some((thing, offset)) = (*user_proc).io_decode(procs[0], addr) {
-                            thing.read_bank(&mut ctx, offset)
-                        } else if let Some((thing, offset)) = (*user_proc).io_decode(procs[1], addr) {
-                            thing.read_bank(&mut ctx, offset)
-                        } else {
-                            0
-                        }
-                    }
-                MEM_PRIV_RA_START..MEM_PRIV_RA_END => 0,
-                MEM_PRIV_V_START..MEM_PRIV_V_END => 0,
-                MEM_SHARED_START..MEM_SHARED_END =>
-                    ctx.vm.memory[(addr as usize).wrapping_sub(MEM_SHARED_START_U)].0,
-                _ => 0
+            },
+            MEM_PRIV_RA_START..MEM_PRIV_RA_END => {},
+            MEM_PRIV_V_START..MEM_PRIV_V_END => {},
+            MEM_SHARED_START..MEM_SHARED_END => {
+                ctx.vm.memory[(addr as usize).wrapping_sub(MEM_SHARED_START_U)].0 = value;
             }
-        } else {
-            0
+            _ => {}
+        };
+    }
+    pub fn user_read(&mut self, uid: u64, addr: u16) -> u16 {
+        let user = self.make_user(uid);
+        let user_addr: *mut VMUser = &mut **user;
+
+        let procs = unsafe {[
+            (*user_addr).proc.as_mut(),
+            (*user_addr).agent.as_mut(),
+        ]};
+        let mut ctx = Cycle {
+            vm: self,
+            user: user_addr,
+        };
+        match addr {
+            0..0x40 => procs[0].read_priv(addr),
+            MEM_PRIV_NV_START..MEM_PRIV_NVT_END =>
+                procs[0].priv_mem[addr as usize - MEM_PRIV_NV_START_U],
+            MEM_PRIV_NVT_END..MEM_PRIV_NV_END => 0,
+            MEM_PRIV_IO_START..MEM_PRIV_IO_END => unsafe {
+                let addr = addr - MEM_PRIV_IO_START;
+                if let Some((thing, offset)) = (*user_addr).io_decode(procs[0], addr) {
+                    thing.read_bank(&mut ctx, offset)
+                } else if let Some((thing, offset)) = (*user_addr).io_decode(procs[1], addr) {
+                    thing.read_bank(&mut ctx, offset)
+                } else {
+                    0
+                }
+            }
+            MEM_PRIV_RA_START..MEM_PRIV_RA_END => 0,
+            MEM_PRIV_V_START..MEM_PRIV_V_END => 0,
+            MEM_SHARED_START..MEM_SHARED_END =>
+                ctx.vm.memory[(addr as usize).wrapping_sub(MEM_SHARED_START_U)].0,
+            _ => 0
         }
     }
     pub fn memory_invalidate(&mut self) {
