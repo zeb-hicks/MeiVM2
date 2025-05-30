@@ -32,7 +32,7 @@ const MEM_SHARED_START: u16 = 0x1000;
 const MEM_SHARED_SIZE: u16 = 0x2000;
 const MEM_SHARED_END: u16 = MEM_SHARED_START + MEM_SHARED_SIZE;
 const MEM_SHARED_START_U: usize = MEM_SHARED_START as usize;
-const MEM_SHARED_SIZE_U: usize = MEM_SHARED_SIZE as usize;
+pub const MEM_SHARED_SIZE_U: usize = MEM_SHARED_SIZE as usize;
 const WORD_DELAY_PRIV_TO_SHARED: u32 = 64;
 const WORD_DELAY_PRIV_FROM_SHARED: u32 = 16;
 
@@ -88,7 +88,7 @@ fn is_shared_mem(addr: u16) -> bool {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-enum DeferredOp {
+pub enum DeferredOp {
     DelayLoad(u8, RegIndex),
     DelayStore(u8),
     WriteBack(RegIndex),
@@ -204,10 +204,12 @@ pub struct WaveProc {
     pub ins_ptr: VMRegister,
     #[serde(deserialize_with = "deserialize_vmproc_mem", serialize_with = "serialize_vmproc_mem")]
     pub priv_mem: [u16; MEM_PRIV_NV_SIZE],
-    sleep_for: u32,
+    pub sleep_for: u32,
+    pub breakpoints: Vec<(u64, u16)>,
+    pub current_breakpoint: Option<(u64, u16)>,
     lval: VMRegister,
     rval: VMRegister,
-    defer: Option<DeferredOp>,
+    pub defer: Option<DeferredOp>,
     #[serde(default)]
     pub core_id: u16,
     #[serde(default)]
@@ -279,8 +281,8 @@ impl Display for WaveProc {
 }
 
 pub struct Cycle<'v> {
-    vm: &'v mut SimulationVM,
-    user: *mut VMUser,
+    pub vm: &'v mut SimulationVM,
+    pub user: *mut VMUser,
 }
 
 impl WaveProc {
@@ -306,6 +308,8 @@ impl WaveProc {
             ins_ptr: VMRegister{x:MEM_PRIV_NV_START, y:0, z:0, w:0}, // reg15.x is instruction pointer
             priv_mem: [0; MEM_PRIV_NV_SIZE],
             sleep_for: 0,
+            breakpoints: Vec::new(),
+            current_breakpoint: None,
             is_running: false,
             current_ins_addr: 0,
             bank1_select: 0,
@@ -398,7 +402,7 @@ impl WaveProc {
             mi += 1;
         }
     }
-    fn read_mem(&mut self, ctx: &mut Cycle, addr: u16) -> u16 {
+    pub fn read_mem(&mut self, ctx: &mut Cycle, addr: u16) -> u16 {
         match addr {
             0..0x40 => self.reg_index((addr >> 2).into()).index(addr as u8),
             MEM_PRIV_NV_START..MEM_PRIV_NVT_END =>
@@ -413,7 +417,7 @@ impl WaveProc {
             _ => 0
         }
     }
-    fn write_mem(&mut self, ctx: &mut Cycle, addr: u16, value: u16) {
+    pub fn write_mem(&mut self, ctx: &mut Cycle, addr: u16, value: u16) {
         match addr {
             0..0x40 =>
             if let Some(reg) = self.reg_index_mut((addr >> 2).into()) {
@@ -619,6 +623,16 @@ impl WaveProc {
             }
         }
         let addr = self.ins_ptr.x;
+
+        if self.current_breakpoint.is_none() {
+            if let Some(bp) = self.breakpoints.iter().position(|&x| x.0 == 0 && x.1 == addr) {
+                self.current_breakpoint = Some(self.breakpoints[bp]);
+                return Ok(());
+            }
+        } else {
+            self.current_breakpoint = None;
+        }
+
         let is_priv_exec = is_priv_mem(addr);
         let is_nta_exec = is_nta_mem(addr);
         let is_shm_exec = is_shared_mem(addr);
@@ -1196,8 +1210,8 @@ impl ModuleBank for NavModule {
 pub struct VMShip {
     pub x: f32, pub y: f32,
     pub vel_x: f32, pub vel_y: f32,
-    accel_x: f32,
-    accel_y: f32,
+    pub accel_x: f32,
+    pub accel_y: f32,
     pub heading: f32,
     pub spin: f32,
     #[serde(flatten)]
@@ -1439,9 +1453,9 @@ pub fn write_io(proc: &mut WaveProc, ctx: &mut Cycle, addr: u16, value: u16) {
 }
 
 pub struct SimulationVM {
-    users: HashMap<u64, Box<VMUser>>,
-    processes: VecDeque<*mut VMUser>,
-    memory: MemoryType,
+    pub users: HashMap<u64, Box<VMUser>>,
+    pub processes: VecDeque<*mut VMUser>,
+    pub memory: MemoryType,
 }
 impl<'de> Deserialize<'de> for SimulationVM {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -1648,6 +1662,88 @@ impl SimulationVM {
         user.dump();
         user.proc.dump();
     }
+    pub fn user_write(&mut self, _: u64, addr: u16, value: u16) {
+        // let user = self.make_user(user_id);
+        if let Some(&user_proc) = self.processes.front() {
+            let procs = unsafe {[
+                (*user_proc).proc.as_mut(),
+                (*user_proc).agent.as_mut(),
+            ]};
+            let mut ctx = Cycle {
+                vm: self,
+                user: user_proc,
+            };
+            // println!("User write: {} to {:04x} in proc {}", value, addr, proc);
+            match addr {
+                0..0x40 => {
+                    // proc.reg_index((addr >> 2).into()).index(addr as u8)
+                    // if let Some(reg) = procs[0].reg_index_mut((addr >> 2).into()) {
+                    //     *reg.index_mut(addr as u8) = value;
+                    // }
+                    procs[0].write_priv(addr, value);
+                },
+                MEM_PRIV_NV_START..MEM_PRIV_NVT_END => {
+                    procs[0].priv_mem[addr as usize - MEM_PRIV_NV_START_U] = value;
+                },
+                MEM_PRIV_NVT_END..MEM_PRIV_NV_END => {},
+                MEM_PRIV_IO_START..MEM_PRIV_IO_END => {
+                    unsafe {
+                        let addr = addr - MEM_PRIV_IO_START;
+                        if let Some((thing, offset)) = (*user_proc).io_decode(procs[0], addr) {
+                            thing.write_bank(&mut ctx, offset, value)
+                        } else if let Some((thing, offset)) = (*user_proc).io_decode(procs[1], addr) {
+                            thing.write_bank(&mut ctx, offset, value)
+                        }
+                    }
+                },
+                MEM_PRIV_RA_START..MEM_PRIV_RA_END => {},
+                MEM_PRIV_V_START..MEM_PRIV_V_END => {},
+                MEM_SHARED_START..MEM_SHARED_END => {
+                    ctx.vm.memory[(addr as usize).wrapping_sub(MEM_SHARED_START_U)].0 = value;
+                }
+                _ => {}
+            };
+        }
+    }
+    pub fn user_read(&mut self, _: u64, addr: u16) -> u16 {
+        // let user = self.make_user(user_id);
+        // let user = self.users.get_mut(&user_id).unwrap();
+        if let Some(&user_proc) = self.processes.front() {
+            let procs = unsafe {[
+                (*user_proc).proc.as_mut(),
+                (*user_proc).agent.as_mut(),
+            ]};
+            let mut ctx = Cycle {
+                vm: self,
+                user: user_proc,
+            };
+            match addr {
+                0..0x40 => procs[0].read_priv(addr),
+                // procs[0].reg_index((addr >> 2).into()).index(addr as u8),
+                MEM_PRIV_NV_START..MEM_PRIV_NVT_END =>
+                    procs[0].priv_mem[addr as usize - MEM_PRIV_NV_START_U],
+                MEM_PRIV_NVT_END..MEM_PRIV_NV_END => 0,
+                MEM_PRIV_IO_START..MEM_PRIV_IO_END =>
+                    unsafe {
+                        let addr = addr - MEM_PRIV_IO_START;
+                        if let Some((thing, offset)) = (*user_proc).io_decode(procs[0], addr) {
+                            thing.read_bank(&mut ctx, offset)
+                        } else if let Some((thing, offset)) = (*user_proc).io_decode(procs[1], addr) {
+                            thing.read_bank(&mut ctx, offset)
+                        } else {
+                            0
+                        }
+                    }
+                MEM_PRIV_RA_START..MEM_PRIV_RA_END => 0,
+                MEM_PRIV_V_START..MEM_PRIV_V_END => 0,
+                MEM_SHARED_START..MEM_SHARED_END =>
+                    ctx.vm.memory[(addr as usize).wrapping_sub(MEM_SHARED_START_U)].0,
+                _ => 0
+            }
+        } else {
+            0
+        }
+    }
     pub fn memory_invalidate(&mut self) {
         for m in self.memory.iter_mut() {
             m.1 = !m.0
@@ -1838,6 +1934,9 @@ impl SimulationVM {
                             match proc.cycle(&mut ctx) {
                                 Ok(()) => { still_running = true; }
                                 Err(_) => { proc.is_running = false; }
+                            }
+                            if !proc.current_breakpoint.is_none() {
+                                ticks = tick_count; // stop the VM
                             }
                         }
                     }
@@ -2727,7 +2826,9 @@ mod tests {
                 bank1_select,
                 protect,
                 mod_selects,
-                con_store
+                con_store,
+                breakpoints,
+                current_breakpoint,
             } = lhs.proc.as_ref();
             let rproc = rhs.proc.as_ref();
             assert_eq!(cval,             &rproc.cval);
@@ -2768,6 +2869,8 @@ mod tests {
                 rval: VMRegister{x:493, y: 0, z: 0, w: 0x8000},
                 ins_ptr: VMRegister{x: 1010, y: 230, z: 2333, w: 0xffff},
                 sleep_for: 22,
+                breakpoints: vec![],
+                current_breakpoint: None,
                 defer: Some(DeferredOp::DelayLoad(0x32, RegIndex::R4)),
                 priv_mem: [0; MEM_PRIV_NV_SIZE],
                 is_running: true,
@@ -2798,6 +2901,8 @@ mod tests {
                 rval: VMRegister{x:493, y: 0, z: 0, w: 0x8000},
                 ins_ptr: VMRegister{x: 1010, y: 230, z: 2333, w: 0xffff},
                 sleep_for: 22,
+                breakpoints: vec![],
+                current_breakpoint: None,
                 defer: Some(DeferredOp::DelayLoad(0x32, RegIndex::R4)),
                 priv_mem: [0; MEM_PRIV_NV_SIZE],
                 is_running: true,
