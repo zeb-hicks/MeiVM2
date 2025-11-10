@@ -1919,13 +1919,9 @@ impl SimulationVM {
             (*user_addr).proc.as_mut(),
             (*user_addr).agent.as_mut(),
         ]};
-        let mut ctx = Cycle {
-            vm: self,
-            user: user_addr,
-        };
         match addr {
             0..0x40 => {
-                procs[0].write_priv(addr, value);
+                user.write_priv(0, addr, value);
             },
             MEM_PRIV_NV_START..MEM_PRIV_NVT_END => {
                 procs[0].priv_mem[addr as usize - MEM_PRIV_NV_START_U] = value;
@@ -1934,6 +1930,10 @@ impl SimulationVM {
             MEM_PRIV_IO_START..MEM_PRIV_IO_END => {
                 unsafe {
                     let addr = addr - MEM_PRIV_IO_START;
+                    let mut ctx = Cycle {
+                        vm: self,
+                        user: user_addr,
+                    };
                     if let Some((thing, offset)) = (*user_addr).io_decode(procs[0], addr) {
                         thing.write_bank(&mut ctx, offset, value)
                     } else if let Some((thing, offset)) = (*user_addr).io_decode(procs[1], addr) {
@@ -1944,7 +1944,7 @@ impl SimulationVM {
             MEM_PRIV_RA_START..MEM_PRIV_RA_END => {},
             MEM_PRIV_V_START..MEM_PRIV_V_END => {},
             MEM_SHARED_START..MEM_SHARED_END => {
-                ctx.vm.memory[(addr as usize).wrapping_sub(MEM_SHARED_START_U)].0 = value;
+                self.memory[(addr as usize).wrapping_sub(MEM_SHARED_START_U)].0 = value;
             }
             _ => {}
         };
@@ -1957,17 +1957,17 @@ impl SimulationVM {
             (*user_addr).proc.as_mut(),
             (*user_addr).agent.as_mut(),
         ]};
-        let mut ctx = Cycle {
-            vm: self,
-            user: user_addr,
-        };
         match addr {
-            0..0x40 => procs[0].read_priv(addr),
+            0..0x40 => user.read_priv(0, addr),
             MEM_PRIV_NV_START..MEM_PRIV_NVT_END =>
                 procs[0].priv_mem[addr as usize - MEM_PRIV_NV_START_U],
             MEM_PRIV_NVT_END..MEM_PRIV_NV_END => 0,
             MEM_PRIV_IO_START..MEM_PRIV_IO_END => unsafe {
                 let addr = addr - MEM_PRIV_IO_START;
+                let mut ctx = Cycle {
+                    vm: self,
+                    user: user_addr,
+                };
                 if let Some((thing, offset)) = (*user_addr).io_decode(procs[0], addr) {
                     thing.read_bank(&mut ctx, offset)
                 } else if let Some((thing, offset)) = (*user_addr).io_decode(procs[1], addr) {
@@ -1979,7 +1979,7 @@ impl SimulationVM {
             MEM_PRIV_RA_START..MEM_PRIV_RA_END => 0,
             MEM_PRIV_V_START..MEM_PRIV_V_END => 0,
             MEM_SHARED_START..MEM_SHARED_END =>
-                ctx.vm.memory[(addr as usize).wrapping_sub(MEM_SHARED_START_U)].0,
+                self.memory[(addr as usize).wrapping_sub(MEM_SHARED_START_U)].0,
             _ => 0
         }
     }
