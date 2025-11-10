@@ -7,9 +7,7 @@ use std::{
     collections::{HashMap, VecDeque}, fmt::Display, sync::Arc
 };
 use serde::{
-    de::{self, Visitor},
-    ser::{self, Serializer},
-    Serialize, Deserialize,
+    de::{self, Visitor}, ser::{self, SerializeStruct, Serializer}, Deserialize, Serialize
 };
 use register::VMRegister;
 use opcode::{ Opcode, VMError, RegIndex, Swizzle };
@@ -38,6 +36,10 @@ const MEM_SHARED_SIZE: u16 = 0x2000;
 const MEM_SHARED_END: u16 = MEM_SHARED_START + MEM_SHARED_SIZE;
 const MEM_SHARED_START_U: usize = MEM_SHARED_START as usize;
 pub const MEM_SHARED_SIZE_U: usize = MEM_SHARED_SIZE as usize;
+const MEM_BLOCK_WORDS: usize = 0x200usize;
+const MEM_BLOCK_SIZE: usize = 256;
+const MEM_BLOCK_START: usize = 0x10;
+const MEM_BLOCK_END: usize = MEM_BLOCK_START + MEM_BLOCK_SIZE;
 const WORD_DELAY_PRIV_TO_SHARED: u32 = 64;
 const WORD_DELAY_PRIV_FROM_SHARED: u32 = 16;
 
@@ -412,7 +414,16 @@ impl WaveProc {
             0..0x40 => self.reg_index((addr >> 2).into()).index(addr as u8),
             MEM_PRIV_NV_START..MEM_PRIV_NVT_END =>
                 self.priv_mem[addr as usize - MEM_PRIV_NV_START_U],
-            MEM_PRIV_NVT_END..MEM_PRIV_NV_END => 0,
+            MEM_PRIV_NVT_END..MEM_PRIV_NV_END => {
+                let bank = self.bank1_select as usize;
+                if bank >= MEM_BLOCK_START && bank < MEM_BLOCK_END {
+                    let bank_index = bank - MEM_BLOCK_START;
+                    unsafe {
+                        let user = &mut *ctx.user;
+                        user.mem_blocks[bank_index].mem[addr as usize - MEM_PRIV_NVT_END as usize]
+                    }
+                } else { 0 }
+            }
             MEM_PRIV_IO_START..MEM_PRIV_IO_END =>
                 read_io(self, ctx, addr - MEM_PRIV_IO_START),
             MEM_PRIV_RA_START..MEM_PRIV_RA_END => 0,
@@ -432,6 +443,14 @@ impl WaveProc {
                 self.priv_mem[addr as usize - MEM_PRIV_NV_START_U] = value;
             }
             MEM_PRIV_NVT_END..MEM_PRIV_NV_END => {
+                let bank = self.bank1_select as usize;
+                if bank >= MEM_BLOCK_START && bank < MEM_BLOCK_END {
+                    let bank_index = bank - MEM_BLOCK_START;
+                    unsafe {
+                        let user = &mut *ctx.user;
+                        user.mem_blocks[bank_index].mem[addr as usize - MEM_PRIV_NVT_END as usize] = value;
+                    }
+                }
             }
             MEM_PRIV_IO_START..MEM_PRIV_IO_END => {
                 write_io(self, ctx, addr - MEM_PRIV_IO_START, value);
@@ -1054,6 +1073,63 @@ impl WaveProc {
 
 pub type MemoryType = [(u16, u16); MEM_SHARED_SIZE_U];
 pub type VMProcType = Box<WaveProc>;
+#[derive(PartialEq)]
+pub struct MemoryBlock {
+    pub mem: [u16; MEM_BLOCK_WORDS],
+}
+
+impl core::fmt::Debug for MemoryBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MemoryBlock{..}")
+    }
+}
+impl<'de> Deserialize<'de> for MemoryBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: de::Deserializer<'de> {
+        struct VisitInner;
+        impl<'de> de::Visitor<'de> for VisitInner {
+            type Value = MemoryBlock;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(formatter, "struct MemoryBlock")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                where A: de::MapAccess<'de>, {
+                let mut mem = [0; MEM_BLOCK_WORDS];
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        "mem" => {
+                            let memory_val: &[u8] = map.next_value()?;
+                            for (index, &b) in memory_val.iter().enumerate() {
+                                mem[index / 2] |= if (index & 1) != 0 { (b as u16) << 8 } else { b as u16 };
+                            }
+                        }
+                        _ => { let serde::de::IgnoredAny = map.next_value()?; }
+                    }
+                }
+                Ok(MemoryBlock { mem, })
+            }
+        }
+        deserializer.deserialize_struct("MemoryBlock", &["mem"], VisitInner)
+    }
+}
+
+impl Serialize for MemoryBlock {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        use ser::SerializeStruct;
+        let mut out =
+            serializer.serialize_struct("MemoryBlock", 1)?;
+        let memory_block: &[u8] = unsafe { core::mem::transmute(self.mem.as_slice()) };
+        struct MemInner<'a>(&'a[u8]);
+        impl Serialize for MemInner<'_> {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where S: Serializer { serializer.serialize_bytes(&self.0) }
+        }
+        out.serialize_field("mem", &MemInner(memory_block))?;
+        out.end()
+    }
+}
+
 
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -1212,33 +1288,98 @@ impl ModuleBank for NavModule {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct VMShip {
-    pub x: f32, pub y: f32,
-    pub vel_x: f32, pub vel_y: f32,
-    pub accel_x: f32,
-    pub accel_y: f32,
+#[derive(Default, Debug, PartialEq)]
+pub struct PhysicsEntity {
+    pub pos: Point2,
+    pub vel: Point2,
+    pub accel: Point2,
     pub heading: f32,
     pub spin: f32,
-    #[serde(flatten)]
-    pub flight: FlightModule,
-    #[serde(flatten)]
-    pub nav: NavModule,
 }
-impl Default for VMShip {
-    fn default() -> Self {
+
+impl PhysicsEntity {
+    pub fn randomize_position(&mut self) {
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        let direction = rng.gen_range(0.0..core::f32::consts::TAU);
+        let (dir_s, dir_c) = rng.gen_range(0.0..core::f32::consts::TAU).sin_cos();
         let speed: f32 = rng.gen_range(10.0..100.0);
+        self.pos = Point2::new(
+            rng.gen_range(0.0..1920.0),
+            rng.gen_range(0.0..256.0));
+        self.vel = Point2::new(dir_c, dir_s) * speed;
+        self.accel = Point2::default();
+        self.spin = rng.gen_range(-5.0..5.0);
+        self.heading = rng.gen_range(0.0..1.0);
+    }
+}
+impl<'de> Deserialize<'de> for PhysicsEntity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: de::Deserializer<'de> {
+        struct VisitPhysicsEntity;
+        impl<'de> de::Visitor<'de> for VisitPhysicsEntity {
+            type Value = PhysicsEntity;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(formatter, "struct PhysicsEntity")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                where A: de::MapAccess<'de>, {
+                let mut x: Option<f32> = None;
+                let mut y: Option<f32> = None;
+                let mut vx: Option<f32> = None;
+                let mut vy: Option<f32> = None;
+                let mut heading: Option<f32> = None;
+                let mut spin: Option<f32> = None;
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        "x" => { x = Some(map.next_value()?); }
+                        "y" => { y = Some(map.next_value()?); }
+                        "vx" => { vx = Some(map.next_value()?); }
+                        "vy" => { vy = Some(map.next_value()?); }
+                        "hdg" => { heading = Some(map.next_value()?); }
+                        "s" => { spin = Some(map.next_value()?); }
+                        _ => {
+                            let serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(PhysicsEntity {
+                    pos: Point2::new(x.unwrap_or_default(), y.unwrap_or_default()),
+                    vel: Point2::new(vx.unwrap_or_default(), vy.unwrap_or_default()),
+                    accel: Point2::default(),
+                    heading: heading.unwrap_or_default(),
+                    spin: spin.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_any(VisitPhysicsEntity)
+    }
+}
+
+impl Serialize for PhysicsEntity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        let mut out = serializer.serialize_struct("PhysicsEntity", 6)?;
+        out.serialize_field("x", &self.pos.x)?;
+        out.serialize_field("y", &self.pos.y)?;
+        out.serialize_field("vx", &self.vel.x)?;
+        out.serialize_field("vy", &self.vel.y)?;
+        out.serialize_field("hdg", &self.heading)?;
+        out.serialize_field("s", &self.spin)?;
+        out.end()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Ship {
+    pub phy: PhysicsEntity,
+    pub flight: FlightModule,
+    pub nav: NavModule,
+}
+
+impl Default for Ship {
+    fn default() -> Self {
         Self {
-            x: rng.gen_range(0.0..1920.0),
-            y: rng.gen_range(0.0..256.0),
-            vel_x: direction.cos() * speed, vel_y: direction.sin() * speed,
-            accel_x: 0.0, accel_y: 0.0,
-            spin: rng.gen_range(-5.0..5.0),
-            heading: rng.gen_range(0.0..1.0),
+            phy: PhysicsEntity::default(),
             flight: FlightModule {
                 color: 0xffff,
                 ..Default::default()
@@ -1249,21 +1390,79 @@ impl Default for VMShip {
         }
     }
 }
-impl Display for VMShip {
+impl Display for Ship {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "VMShip([{}, {}], [{}, {}] {:4x} {:4x})",
-            self.x, self.y, self.vel_x, self.vel_y,
-            (self.heading * 32768.0) as u16, self.flight.color
+        write!(f, "Ship([{}, {}], [{}, {}] {:4x} {:4x})",
+            self.phy.pos.x, self.phy.pos.y, self.phy.vel.x, self.phy.vel.y,
+            (self.phy.heading * 32768.0) as u16, self.flight.color
             )
     }
 }
-impl VMShip {
+impl Ship {
     pub fn set_color(&mut self, color: u32) {
         let (r, g, b) = ((color >> 16) as u8, (color >> 8) as u8, color as u8);
         self.flight.color =
             (((r & 0b0011111000) as u16) << 8) |
             (((g & 0b0011111100) as u16) << 3) |
             (((b & 0b0011111000) as u16) >> 3);
+    }
+}
+impl<'de> Deserialize<'de> for Ship {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: de::Deserializer<'de> {
+        struct VisitShip;
+        impl<'de> de::Visitor<'de> for VisitShip {
+            type Value = Ship;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(formatter, "struct Ship")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                where A: de::MapAccess<'de>, {
+                let mut phy: Option<PhysicsEntity> = None;
+                let mut flight: Option<FlightModule> = None;
+                let mut nav: Option<NavModule> = None;
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        "x" => { phy.get_or_insert_default().pos.x = map.next_value()?; }
+                        "y" => { phy.get_or_insert_default().pos.y = map.next_value()?; }
+                        "vx" => { phy.get_or_insert_default().vel.x = map.next_value()?; }
+                        "vy" => { phy.get_or_insert_default().vel.y = map.next_value()?; }
+                        "vel_x" => { phy.get_or_insert_default().vel.x = map.next_value()?; }
+                        "vel_y" => { phy.get_or_insert_default().vel.y = map.next_value()?; }
+                        "hdg" => { phy.get_or_insert_default().heading = map.next_value()?; }
+                        "heading" => { phy.get_or_insert_default().heading = map.next_value()?; }
+                        "s" => { phy.get_or_insert_default().spin = map.next_value()?; }
+                        "spin" => { phy.get_or_insert_default().spin = map.next_value()?; }
+                        "phy" => {
+                            phy = Some(map.next_value()?);
+                        }
+                        "flight" => { flight = Some(map.next_value()?); }
+                        "nav" => { nav = Some(map.next_value()?); }
+                        _ => {
+                            let serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(Ship {
+                    phy: phy.unwrap_or_default(),
+                    flight: flight.unwrap_or_default(),
+                    nav: nav.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_any(VisitShip)
+    }
+}
+
+impl Serialize for Ship {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        let mut out = serializer.serialize_struct("Ship", 4)?;
+        out.serialize_field("V", &1)?;
+        out.serialize_field("phy", &self.phy)?;
+        out.serialize_field("flight", &self.flight)?;
+        out.serialize_field("nav", &self.nav)?;
+        out.end()
     }
 }
 
@@ -1354,8 +1553,19 @@ impl ModuleBank for WaveProc {
             0x0d => if reg_enable { self.save_ri.y = value; },
             0x0e => if reg_enable { self.save_ri.z = value; },
             0x0f => if reg_enable { self.save_ri.w = value; },
-            0x11 => if reg_enable { self.bank1_select = value; }, // thread 0 bank
-            0x12 => if reg_enable { self.bank1_select = value; },
+            0x11 | 0x12 => if reg_enable { // thread 0 bank
+                unsafe {
+                    let value = value as usize;
+                    if value >= MEM_BLOCK_START && value < MEM_BLOCK_END {
+                        let value = value - MEM_BLOCK_START;
+                        let length = (*ctx.user).mem_blocks.len();
+                        if value > length {
+                            (*ctx.user).mem_blocks.reserve(length - value);
+                        }
+                    }
+                }
+                self.bank1_select = value;
+            },
             0x19..0x20 => if reg_enable {
                 self.mod_selects[offset as usize - 0x19] = value;
             }
@@ -1377,7 +1587,7 @@ pub struct VMUser {
     pub proc: VMProcType,
     #[serde(default = "default_thread1")]
     pub agent: VMProcType,
-    pub ship: VMShip,
+    pub ship: Ship,
     pub user_login: String,
     pub user_name: String,
     pub user_color: u32,
@@ -1386,6 +1596,7 @@ pub struct VMUser {
     pub ident_time: u32,
     #[serde(skip)]
     pub requested_fields: u32,
+    pub mem_blocks: Vec<MemoryBlock>,
 }
 fn default_thread0() -> Box<WaveProc> {
     Box::new(WaveProc::new(0))
@@ -1400,13 +1611,14 @@ impl Default for VMUser {
             eid: 0,
             proc: default_thread0(),
             agent: default_thread1(),
-            ship: VMShip::default(),
+            ship: Ship::default(),
             user_color: 0xffffff,
             user_color_loaded: false,
             ident_time: 0,
             requested_fields: 0,
             user_name: String::default(),
             user_login: String::default(),
+            mem_blocks: Vec::new(),
         }
     }
 }
@@ -1488,7 +1700,9 @@ impl<'de> Deserialize<'de> for SimulationVM {
                             }
                         }
                         "users" => { users = map.next_value()?; }
-                        _ => {}
+                        _ => {
+                            let serde::de::IgnoredAny = map.next_value()?;
+                        }
                     }
                 }
                 let mut vm = SimulationVM {
@@ -1534,8 +1748,8 @@ impl Serialize for SimulationVM {
 }
 
 pub trait VMAccessPriv {
-    fn read_priv(&self, addr: u16) -> u16;
-    fn write_priv(&mut self, addr: u16, value: u16);
+    fn read_priv(&self, core_id: u8, addr: u16) -> u16;
+    fn write_priv(&mut self, core_id: u8, addr: u16, value: u16);
 }
 unsafe impl Send for SimulationVM {}
 
@@ -1548,25 +1762,48 @@ impl Iterator for VMThreads<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let user = unsafe { self.iter.next()?.as_ref()? };
-        let val = user.proc.read_priv(user.proc.ins_ptr.x);
+        let val = user.read_priv(0, user.proc.ins_ptr.x);
         Some(format!("{} {:4x}: {}", user.proc, val, Opcode::parse(val)))
     }
 }
 
-impl VMAccessPriv for WaveProc {
-    fn read_priv(&self, addr: u16) -> u16 {
+impl VMAccessPriv for VMUser {
+    fn read_priv(&self, core_id: u8, addr: u16) -> u16 {
+        let proc =
+            if core_id == 0 { self.proc.as_ref() }
+            else if core_id == 1 { self.agent.as_ref() }
+            else { return 0 };
         if addr < 0x40 {
-            self.reg_index((addr >> 2).into()).index(addr as u8)
+            proc.reg_index((addr >> 2).into()).index(addr as u8)
         } else if addr < MEM_PRIV_NVT_END {
-            self.priv_mem[addr as usize - MEM_PRIV_NV_START_U]
+            proc.priv_mem[addr as usize - MEM_PRIV_NV_START_U]
+        } else if addr < MEM_PRIV_NV_END {
+            let bank = proc.bank1_select as usize;
+            if bank >= MEM_BLOCK_START && bank < MEM_BLOCK_END {
+                let bank_index = bank - MEM_BLOCK_START;
+                self.mem_blocks[bank_index]
+                    .mem[addr as usize - MEM_PRIV_NVT_END as usize]
+            } else { 0 }
         } else { 0 }
     }
-    fn write_priv(&mut self, addr: u16, value: u16) {
+    fn write_priv(&mut self, core_id: u8, addr: u16, value: u16) {
+        let proc =
+            if core_id == 0 { self.proc.as_mut() }
+            else if core_id == 1 { self.agent.as_mut() }
+            else { return };
         if addr < 0x40 {
-            let reg = self.reg_index_priv_mut((addr >> 2).into());
+            let reg = proc.reg_index_priv_mut((addr >> 2).into());
             *reg.index_mut(addr as u8) = value;
         } else if addr < MEM_PRIV_NVT_END {
-            self.priv_mem[addr as usize - MEM_PRIV_NV_START_U] = value;
+            proc.priv_mem[addr as usize - MEM_PRIV_NV_START_U] = value;
+        } else if addr < MEM_PRIV_NV_END {
+            let bank = proc.bank1_select as usize;
+            if bank >= MEM_BLOCK_START && bank < MEM_BLOCK_END {
+                let bank_index = bank - MEM_BLOCK_START;
+                self.mem_blocks[bank_index]
+                    .mem[addr as usize - MEM_PRIV_NVT_END as usize]
+                    = value;
+            }
         }
     }
 }
@@ -1588,7 +1825,9 @@ impl SimulationVM {
     }
     pub fn make_user(&mut self, user: u64) -> &mut Box<VMUser> {
         self.users.entry(user).or_insert_with(|| {
-            Box::new(VMUser::default())
+            let mut user = Box::new(VMUser::default());
+            user.ship.phy.randomize_position();
+            user
         });
         self.users.get_mut(&user).unwrap()
     }
@@ -1756,12 +1995,11 @@ impl SimulationVM {
     }
     pub fn velocities_mul(&mut self, factor: f32) {
         for (_, user) in self.users.iter_mut() {
-            user.ship.vel_x *= factor;
-            user.ship.vel_y *= factor;
+            user.ship.phy.vel *= factor;
         }
     }
     pub fn ships_apply<F>(&mut self, mut apply: F)
-        where F: for<'a> FnMut(&'a mut VMShip, u64) -> (),
+        where F: for<'a> FnMut(&'a mut Ship, u64) -> (),
     {
         for (uid, user) in self.users.iter_mut() {
             apply(&mut user.ship, *uid);
@@ -1808,39 +2046,37 @@ impl SimulationVM {
             }
             //if self.collision_entities.len() == 0 { user.ident_time = 1; }
             self.collision_entities.push(&raw mut **user);
-            let ship = &mut user.ship;
-            let mut pos = Point2::new(ship.x, ship.y);
-            let mut vel = Point2::new(ship.vel_x, ship.vel_y);
-            let mut accel = Point2::new(ship.accel_x, ship.accel_y);
+            let Ship { phy, flight, nav } = &mut user.ship;
+            let mut pos = phy.pos;
+            let mut vel = phy.vel;
+            let mut accel = phy.accel;
             pos += vel * delta_time + accel * delta_time_s;
             vel = vel + accel * delta_time;
             let vel_abs = vel.length();
             if vel_abs > 1024.0 {
                 vel = vel * vel_abs.recip() * 1024.0;
             }
-            ship.heading = (ship.heading + ship.spin * delta_time).fract();
-            let (head_s, head_c) = (ship.heading * core::f32::consts::TAU).sin_cos();
+            phy.heading = (phy.heading + phy.spin * delta_time).fract();
+            let (head_s, head_c) = (phy.heading * core::f32::consts::TAU).sin_cos();
             let rot_x = Point2::new(head_c, head_s);
             let rot_y = Point2::new(head_s, -head_c);
-            let engine_limited = ship.flight.engine & 15;
+            let engine_limited = flight.engine & 15;
             let engine_on = engine_limited != 0;
-            let gyro_abs = (ship.flight.engine & (16|32)) == (16|32);
-            let gyro_rel = (ship.flight.engine & (16|32)) == 16;
-            if gyro_abs && ship.flight.req_heading < 0x8000 {
-                let req = (ship.flight.req_heading & 0x7fff) as f32 * 0.000030517578125;
-                let delta = (req + 0.5 - ship.heading) % 1.0 - 0.5;
+            let gyro_abs = (flight.engine & (16|32)) == (16|32);
+            let gyro_rel = (flight.engine & (16|32)) == 16;
+            if gyro_abs && flight.req_heading < 0x8000 {
+                let req = (flight.req_heading & 0x7fff) as f32 * 0.000030517578125;
+                let delta = (req + 0.5 - phy.heading) % 1.0 - 0.5;
                 const NYOOM: f32 = 4.5;
-                let spin = (delta * 8.0).clamp(-NYOOM, NYOOM);
-                ship.spin = spin;
+                phy.spin = (delta * 8.0).clamp(-NYOOM, NYOOM);
                 //eprintln!("{:4x} {:1.7} {:1.7} {:1.7} {:1.7}",
-                //    ship.flight.req_heading, req,
-                //    ship.heading, delta, ship.spin);
+                //    flight.req_heading, req,
+                //    phy.heading, delta, phy.spin);
             }
             // TODO try to pick the shorter of two spins about the rotation axis
             // instead of biasing to zero
             if gyro_rel {
-                let spin = (ship.flight.req_heading as i16 as f32) * 0.00390625;
-                ship.spin = spin;
+                phy.spin = (flight.req_heading as i16 as f32) * 0.00390625;
             }
 //       -1.0                     0x0000 (0.0, 1.0)
 //       +Y         (-0.7, 0.7)      ^
@@ -1852,22 +2088,22 @@ impl SimulationVM {
 //       -Y                          v
 //                                0x4000 (0.0, -1.0)
             let rel_vel = Point2::new(vel.dot(rot_x), vel.dot(rot_y));
-            ship.flight.current_compass = ((ship.heading * 32768.0).round() as i32 & 0x7fff) as u16;
-            ship.flight.current_vel_x = (rel_vel.x * 256.0).round().clamp(-32768.0, 32767.0) as i16 as u16;
-            ship.flight.current_vel_y = (rel_vel.y * 256.0).round().clamp(-32768.0, 32767.0) as i16 as u16;
+            flight.current_compass = ((phy.heading * 32768.0).round() as i32 & 0x7fff) as u16;
+            flight.current_vel_x = (rel_vel.x * 256.0).round().clamp(-32768.0, 32767.0) as i16 as u16;
+            flight.current_vel_y = (rel_vel.y * 256.0).round().clamp(-32768.0, 32767.0) as i16 as u16;
             if engine_on {
                 let flight_req_vel = Point2::new(
-                    ship.flight.req_vel_x as i16 as f32,
-                    ship.flight.req_vel_y as i16 as f32);
+                    flight.req_vel_x as i16 as f32,
+                    flight.req_vel_y as i16 as f32);
                 let flight_cur_vel = Point2::new(
-                    ship.flight.current_vel_x as i16 as f32,
-                    ship.flight.current_vel_y as i16 as f32);
+                    flight.current_vel_x as i16 as f32,
+                    flight.current_vel_y as i16 as f32);
                 let delta = (flight_req_vel - flight_cur_vel) * 0.00390625;
                 // println!("ship: {:8.2},{:8.2} {:8.2},{:8.2} {:8.2},{:8.2} h{:04x}, s{:6.2} {:04x}:{:04x} {:6.2} {:6.2}",
                 //     pos.x, pos.y, rel_vel.x, rel_vel.y,
                 //     accel.x, accel.y,
-                //     ship.flight.current_compass, ship.spin,
-                //     ship.flight.req_vel_x, ship.flight.req_vel_y,
+                //     flight.current_compass, phy.spin,
+                //     flight.req_vel_x, flight.req_vel_y,
                 //     delta.x, delta.y,
                 //     );
                 if 15 != engine_limited {
@@ -1924,14 +2160,14 @@ impl SimulationVM {
                 pos.y -= BOTTOM_EDGE;
                 //vel.y = -vel.y;
             }
-            ship.nav.current_ship_x = pos.x.round().clamp(-32768.0, 32767.0) as i16 as u16;
-            ship.nav.current_ship_y = pos.y.round().clamp(-32768.0, 32767.0) as i16 as u16;
-            if ship.nav.target_select == 0 {
+            nav.current_ship_x = pos.x.round().clamp(-32768.0, 32767.0) as i16 as u16;
+            nav.current_ship_y = pos.y.round().clamp(-32768.0, 32767.0) as i16 as u16;
+            if nav.target_select == 0 {
                 // TODO the point should be selected relative to the
                 // shortest path across wrapped screen space
                 let nav_target_screen = Point2::new(
-                    ship.nav.target_screen_x as i16 as f32,
-                    ship.nav.target_screen_y as i16 as f32
+                    nav.target_screen_x as i16 as f32,
+                    nav.target_screen_y as i16 as f32
                 );
                 let target_point = nav_target_screen - pos;
                 let rel_target_point = Point2::new(target_point.dot(rot_x), target_point.dot(rot_y));
@@ -1941,14 +2177,14 @@ impl SimulationVM {
                 let i_rel_heading = ((rel_heading * 32768.0).round() as i32 & 0x7fff) as u16;
                 let i_abs_heading = ((abs_heading * 32768.0).round() as i32 & 0x7fff) as u16;
                 (
-                    ship.nav.target_rel_dist_x,
-                    ship.nav.target_rel_dist_y,
-                    ship.nav.target_rel_vel_x,
-                    ship.nav.target_rel_vel_y,
-                    ship.nav.target_rel_heading_to,
-                    ship.nav.target_rel_heading_fro,
-                    ship.nav.target_abs_heading_to,
-                    ship.nav.target_abs_heading_fro,
+                    nav.target_rel_dist_x,
+                    nav.target_rel_dist_y,
+                    nav.target_rel_vel_x,
+                    nav.target_rel_vel_y,
+                    nav.target_rel_heading_to,
+                    nav.target_rel_heading_fro,
+                    nav.target_abs_heading_to,
+                    nav.target_abs_heading_fro,
                 ) = (
                     rel_target_point.x.round().clamp(-32768.0, 32767.0) as i16 as u16,
                     rel_target_point.y.round().clamp(-32768.0, 32767.0) as i16 as u16,
@@ -1961,12 +2197,9 @@ impl SimulationVM {
                 );
             }
             // todo: put vectors into the ship struct, instead of this
-            ship.x = pos.x;
-            ship.y = pos.y;
-            ship.vel_x = vel.x;
-            ship.vel_y = vel.y;
-            ship.accel_x = accel.x;
-            ship.accel_y = accel.y;
+            phy.pos = pos;
+            phy.vel = vel;
+            phy.accel = accel;
         }
         let entity_count = self.collision_entities.len();
         for lhs_index in 0..entity_count {
@@ -1975,12 +2208,12 @@ impl SimulationVM {
                     let lhs_ptr = self.collision_entities[lhs_index];
                     let rhs_ptr = self.collision_entities[rhs_index];
                     assert_ne!(lhs_ptr, rhs_ptr);
-                    (&mut (*lhs_ptr).ship, &mut (*rhs_ptr).ship)
+                    (&mut (*lhs_ptr).ship.phy, &mut (*rhs_ptr).ship.phy)
                 };
-                let mut lhs_pos = Point2::new(lhs_ship.x, lhs_ship.y);
-                let mut rhs_pos = Point2::new(rhs_ship.x, rhs_ship.y);
-                let mut lhs_vel = Point2::new(lhs_ship.vel_x, lhs_ship.vel_y);
-                let mut rhs_vel = Point2::new(rhs_ship.vel_x, rhs_ship.vel_y);
+                let mut lhs_pos = lhs_ship.pos.clone();
+                let mut rhs_pos = rhs_ship.pos.clone();
+                let mut lhs_vel = lhs_ship.vel.clone();
+                let mut rhs_vel = rhs_ship.vel.clone();
                 let dist_sq = lhs_pos.distance2(rhs_pos);
                 if dist_sq < ship_collider2 {
                     let diff = (ship_collider2 - dist_sq).sqrt();
@@ -1996,14 +2229,10 @@ impl SimulationVM {
                     //}
                     lhs_pos += lr_norm * (diff * -0.5);
                     rhs_pos += lr_norm * (diff * 0.5);
-                    lhs_ship.x = lhs_pos.x;
-                    lhs_ship.y = lhs_pos.y;
-                    rhs_ship.x = rhs_pos.x;
-                    rhs_ship.y = rhs_pos.y;
-                    lhs_ship.vel_x = lhs_vel.x;
-                    lhs_ship.vel_y = lhs_vel.y;
-                    rhs_ship.vel_x = rhs_vel.x;
-                    rhs_ship.vel_y = rhs_vel.y;
+                    lhs_ship.pos = lhs_pos;
+                    rhs_ship.pos = rhs_pos;
+                    lhs_ship.vel = lhs_vel;
+                    rhs_ship.vel = rhs_vel;
                     // collision response... maybe
                     // maybe possible ways of doing this
                     // dot the velocities (maybe)
@@ -2015,12 +2244,10 @@ impl SimulationVM {
         }
         let mut energy = 0f64;
         for lhs_index in 0..entity_count {
-            let lhs_ship = unsafe {
+            unsafe {
                 let lhs_ptr = self.collision_entities[lhs_index];
-                &mut (*lhs_ptr).ship
+                energy += (*lhs_ptr).ship.phy.vel.length2() as f64;
             };
-            let lhs_vel = Point2::new(lhs_ship.vel_x, lhs_ship.vel_y);
-            energy += lhs_vel.length2() as f64;
         }
         //eprint!("ENERGY: {energy}\r");
         while ticks < tick_count {
@@ -2113,9 +2340,9 @@ impl SimulationVM {
         out.push(4); // prepare to update the ships
         for (_ , user) in self.users.iter() {
             let ship = &user.ship;
-            let x = ship.x as i16 as u16;
-            let y = ship.y as i16 as u16;
-            let h = (ship.heading * 32768.0) as i16 as u16;
+            let x = ship.phy.pos.x as i16 as u16;
+            let y = ship.phy.pos.y as i16 as u16;
+            let h = (ship.phy.heading * 32768.0) as i16 as u16;
             let c = ship.flight.color;
             if user.ident_time > 0 {
                 out.push(6); // with IDENT
@@ -2139,7 +2366,7 @@ impl SimulationVM {
     }
 }
 
-pub fn vm_write(split: &mut std::str::SplitWhitespace, vmproc: &mut dyn VMAccessPriv, start_addr: u16) {
+pub fn vm_write(split: &mut std::str::SplitWhitespace, user: &mut dyn VMAccessPriv, core_id: u8, start_addr: u16) {
     let mut val: u16 = 0;
     let mut addr = start_addr;
     let order = [12u32,8,4,0];
@@ -2180,7 +2407,7 @@ pub fn vm_write(split: &mut std::str::SplitWhitespace, vmproc: &mut dyn VMAccess
                     val >>= ofs;
                     if val == 0 { val = 1; }
                     while val > 0 {
-                        vmproc.write_priv(addr, 0);
+                        user.write_priv(core_id, addr, 0);
                         addr = addr.wrapping_add(1);
                         val -= 1;
                     }
@@ -2194,7 +2421,7 @@ pub fn vm_write(split: &mut std::str::SplitWhitespace, vmproc: &mut dyn VMAccess
                     val >>= ofs;
                     if val == 0 { val = 1; }
                     while val > 0 {
-                        vmproc.write_priv(addr, last_written);
+                        user.write_priv(core_id, addr, last_written);
                         addr = addr.wrapping_add(1);
                         val -= 1;
                     }
@@ -2207,7 +2434,7 @@ pub fn vm_write(split: &mut std::str::SplitWhitespace, vmproc: &mut dyn VMAccess
                     let ofs = unorder[ofs_index as usize];
                     val >>= ofs;
                     last_written = val;
-                    vmproc.write_priv(addr, val);
+                    user.write_priv(core_id, addr, val);
                     addr = addr.wrapping_add(1);
                     ofs_index = 0;
                     val = 0;
@@ -2216,7 +2443,7 @@ pub fn vm_write(split: &mut std::str::SplitWhitespace, vmproc: &mut dyn VMAccess
                 // left align and write current value
                 'ᚲ' => {
                     last_written = val;
-                    vmproc.write_priv(addr, val);
+                    user.write_priv(core_id, addr, val);
                     addr = addr.wrapping_add(1);
                     ofs_index = 0;
                     val = 0;
@@ -2237,7 +2464,7 @@ pub fn vm_write(split: &mut std::str::SplitWhitespace, vmproc: &mut dyn VMAccess
             }
             if ofs_index >= 4 {
                 last_written = val;
-                vmproc.write_priv(addr, val);
+                user.write_priv(core_id, addr, val);
                 val = 0;
                 addr += 1;
                 ofs_index = 0;
@@ -2246,7 +2473,7 @@ pub fn vm_write(split: &mut std::str::SplitWhitespace, vmproc: &mut dyn VMAccess
         if command_break { break }
     }
     if ofs_index > 0 {
-        vmproc.write_priv(addr, val);
+        user.write_priv(core_id, addr, val);
     }
 }
 
@@ -2327,17 +2554,19 @@ mod tests {
         assert!(!u.proc.is_running);
         (&vm.memory, &u.proc)
     }
+
     fn vm_setup(to_write: &[u16], to_code: &[u16]) -> Box<SimulationVM> {
         let mut vm = SimulationVM::new();
         let user = vm.user_new(0);
         for (index, &value) in to_write.iter().enumerate() {
-            user.proc.write_priv(index as u16, value);
+            user.write_priv(0, index as u16, value);
         }
         for (index, &value) in to_code.iter().enumerate() {
-            user.proc.write_priv(0x40 + index as u16, value);
+            user.write_priv(0, 0x40 + index as u16, value);
         }
         vm
     }
+
     #[test]
     fn ins_wselect() {
         let to_write = &[
@@ -2742,12 +2971,10 @@ mod tests {
         let to_code = &[ 0 ];
         let mut vm = vm_setup(to_write, to_code);
         let user = vm.make_user(0);
-        user.ship.x = 90.0f32;
-        user.ship.y = 90.0f32;
-        user.ship.vel_x = 0.0;
-        user.ship.vel_y = 0.0;
-        user.ship.spin = 0.0;
-        user.ship.heading = 0.0;
+        user.ship.phy.pos = Point2::new(90.0f32, 90.0f32);
+        user.ship.phy.vel = Point2::default();
+        user.ship.phy.spin = 0.0;
+        user.ship.phy.heading = 0.0;
         user.ship.nav.target_select = 0;
         //user.ship.nav.target_screen_x = 130;
         //user.ship.nav.target_screen_y = 50;
@@ -2778,7 +3005,7 @@ mod tests {
         let mut rel_points = [(0,0); 8];
         for (index, &heading) in headings.iter().enumerate() {
             let user = vm.make_user(0);
-            user.ship.heading = heading;
+            user.ship.phy.heading = heading;
             vm_wait_run(&mut vm);
             let user = vm.make_user(0);
             rel_heading_to[index] =
@@ -2792,7 +3019,7 @@ mod tests {
         }
         for (index, &(point_x, point_y)) in points.iter().enumerate() {
             let user = vm.make_user(0);
-            user.ship.heading = 0.25;
+            user.ship.phy.heading = 0.25;
             user.ship.nav.target_screen_x = (90 + point_x) as u16;
             user.ship.nav.target_screen_y = (90 + point_y) as u16;
             vm_wait_run(&mut vm);
@@ -2816,8 +3043,8 @@ mod tests {
         expectations: Vec<Option<u16>>,
     }
     impl VMAccessPriv for TestVM {
-        fn read_priv(&self, _: u16) -> u16 { 0 }
-        fn write_priv(&mut self, addr: u16, value: u16) {
+        fn read_priv(&self, _: u8, _: u16) -> u16 { 0 }
+        fn write_priv(&mut self, _: u8, addr: u16, value: u16) {
             let expect_value = self.expectations.get(addr as usize).unwrap_or(&None);
             assert_eq!((addr, expect_value), (addr, &Some(value)));
         }
@@ -2826,7 +3053,7 @@ mod tests {
     fn test_write_run(test_string: &str, exp: Vec<Option<u16>>) {
         let mut vm = TestVM{expectations: exp};
         let mut split = test_string.split_whitespace();
-        vm_write(&mut split, &mut vm, 0);
+        vm_write(&mut split, &mut vm, 0, 0);
     }
     #[test]
     fn test_write_simple() {
@@ -3033,7 +3260,7 @@ mod tests {
                     nta_from_sma: MemoryProtect::AccessException,
                 },
             }),
-            ship: VMShip::default(),
+            ship: Ship::default(),
             user_color_loaded: true,
             user_color: 0xcccccc,
             user_name: String::from("Test"),

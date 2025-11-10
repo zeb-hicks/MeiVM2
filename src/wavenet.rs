@@ -24,7 +24,7 @@ use tokio_tungstenite::{
     WebSocketStream,
     tungstenite::protocol::Message as WSMessage,
 };
-use meivm2::{SimulationVM, vm_write, write_persist, read_persist};
+use meivm2::{SimulationVM, vm_write, write_persist, read_persist, vectormath::Point2};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,12 +89,12 @@ async fn sim_parse_chat(
                 sim_vm.user_run(user_id);
             }
             "write" => {
-                let vmproc = &mut sim_vm.make_user(user_id).proc;
-                vm_write(&mut split, vmproc.as_mut(), 0);
+                let user = sim_vm.make_user(user_id);
+                vm_write(&mut split, user.as_mut(), 0, 0);
             }
             "code" => {
-                let vmproc = &mut sim_vm.make_user(user_id).proc;
-                vm_write(&mut split, vmproc.as_mut(), 0x40);
+                let user = sim_vm.make_user(user_id);
+                vm_write(&mut split, user.as_mut(), 0, 0x40);
             }
             "stop" | "halt" | "crash" | "lunch" => {
                 sim_vm.user_halt(user_id);
@@ -368,8 +368,9 @@ async fn simulation(settings: &'static ServerState,
     let (ext_tx, mut ext_rx) = mpsc::channel(256);
     let (cmd_rep_tx, cmd_rep_rx) = mpsc::channel(16);
     let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
-    let mut sim_vm = fs::read("wave.state").await.ok()
-        .and_then(|state| read_persist(&state).ok()).unwrap_or_else(SimulationVM::new);
+    let mut sim_vm =
+        fs::read("wave.state").await.ok()
+        .and_then(|state| read_persist(&state).expect("invalid wave state")).unwrap_or_else(SimulationVM::new);
     tokio::spawn(command_socket_task(cmd_rep_rx, cmd_tx));
     let mut persist_interval = time::interval(time::Duration::from_secs(60));
     enum SimulationSelect {
@@ -503,16 +504,14 @@ async fn simulation(settings: &'static ServerState,
                         let Some(x) = get_me_the_next_i64_please(&mut args) else { continue };
                         let Some(y) = get_me_the_next_i64_please(&mut args) else { continue };
                         let Some(user) = sim_vm.find_user_eid(eid as u32) else { continue };
-                        user.ship.x = x as f32;
-                        user.ship.y = y as f32;
+                        user.ship.phy.pos = Point2::new(x as f32, y as f32);
                     }
                     2 => {
                         let Some(eid) = get_me_the_next_i64_please(&mut args) else { continue };
                         let Some(x) = get_me_the_next_i64_please(&mut args) else { continue };
                         let Some(y) = get_me_the_next_i64_please(&mut args) else { continue };
                         let Some(user) = sim_vm.find_user_eid(eid as u32) else { continue };
-                        user.ship.vel_x = x as f32;
-                        user.ship.vel_y = y as f32;
+                        user.ship.phy.vel = Point2::new(x as f32, y as f32);
                     }
                     _ => {}
                 }
@@ -547,14 +546,11 @@ async fn simulation(settings: &'static ServerState,
                         if let Ok(state) = write_persist(sim_vm.as_ref()) {
                             if let Err(e) = fs::write("wave.state", &state).await {
                                 eprintln!("saving vm state failed: {e}");
-                            } else {
-                                eprintln!("vm state saved");
                             }
                             if let Err(e) = fs::write("wave.state.backup", &state).await {
                                 eprintln!("saving vm state failed: {e}");
-                            } else {
-                                eprintln!("vm state saved");
                             }
+                            eprintln!("vm state saved");
                         } else {
                             eprintln!("serialize vm state failed");
                         }
